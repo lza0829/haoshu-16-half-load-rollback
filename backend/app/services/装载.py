@@ -1,4 +1,12 @@
+"""装载服务 · 半截装载回滚口径甲：单事务原子回滚。
+
+一批正式写库（枢纽→链接→卫星）与「装载事务日志、批次成功标志」同属一个事务：
+任一步失败整体回滚，正式三族该批增量自然为零；随后独立小事务把批次记为失败。
+不存在段间提交，故无补偿器、无清扫路径、无「补偿未完却标终结」窗口；
+批号一次性，同批号重试/补偿并发直接被拒，重试须换新批号。
+"""
 import json
+import sqlite3
 import uuid
 from typing import Any
 
@@ -7,22 +15,35 @@ from app.seed import 哈希键, 载荷哈希, 此刻
 
 
 def 装一批(体: dict[str, Any]) -> dict[str, Any]:
-    """顺序：枢纽 → 链接 → 卫星。失败整批回滚。"""
+    """顺序：枢纽 → 链接 → 卫星。任一步失败整批回滚，批次记失败。"""
     装载日 = str(体.get("装载日") or "").strip()
+    if not 装载日:
+        return {"结果": "拒绝", "说明": "缺装载日"}
     枢纽 = 体.get("枢纽") or {}
     链接 = 体.get("链接") or {}
     卫星 = 体.get("卫星") or {}
-    if not 装载日:
-        return {"结果": "拒绝", "说明": "缺装载日"}
-
     批号 = str(体.get("批次编号") or f"批-{uuid.uuid4().hex[:10]}")
-    conn = 连接()
-    报 = {"枢纽": 0, "链接": 0, "卫星": 0, "跳过": 0, "明细": []}
-    try:
-        if conn.execute("SELECT 1 FROM 装载批次 WHERE 编号=?", (批号,)).fetchone():
-            return {"结果": "拒绝", "说明": "批次编号已存在"}
+    事务号 = uuid.uuid4().hex
 
-        # 枢纽
+    # ① 认领批号（独立小事务）：批号一次性，杜绝同批重试/补偿交错
+    conn = 连接()
+    try:
+        try:
+            conn.execute(
+                "INSERT INTO 装载批次(编号, 装载日, 时刻, 状态, 事务号) VALUES (?,?,?,'装载中',?)",
+                (批号, 装载日, 此刻(), 事务号),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            return {"结果": "拒绝", "说明": f"批次编号已存在:{批号}（批号一次性，重试须换新批号）"}
+    finally:
+        conn.close()
+
+    报 = {"枢纽": 0, "链接": 0, "卫星": 0, "跳过": 0, "明细": []}
+    conn = 连接()
+    try:
+        # ② 单事务装载：正式三族 + 事务日志 + 批次成功标志同生共死
         for 类, 表, 前缀 in (
             ("号卡", "枢纽_号卡", "号卡"),
             ("套餐", "枢纽_套餐", "套餐"),
@@ -40,8 +61,8 @@ def 装一批(体: dict[str, Any]) -> dict[str, Any]:
                     报["明细"].append({"类": f"枢纽-{类}", "业务键": 业务键, "结果": "已存在"})
                     continue
                 conn.execute(
-                    f"INSERT INTO {表}(哈希键, 业务键, 装载日) VALUES (?,?,?)",
-                    (h, 业务键, 装载日),
+                    f"INSERT INTO {表}(哈希键, 业务键, 装载日, 批号) VALUES (?,?,?,?)",
+                    (h, 业务键, 装载日, 批号),
                 )
                 报["枢纽"] += 1
                 报["明细"].append({"类": f"枢纽-{类}", "业务键": 业务键, "哈希键": h, "结果": "新开"})
@@ -63,8 +84,8 @@ def 装一批(体: dict[str, Any]) -> dict[str, Any]:
                 报["跳过"] += 1
                 continue
             conn.execute(
-                "INSERT INTO 链接_号卡套餐(哈希键, 号卡哈希, 套餐哈希, 装载日) VALUES (?,?,?,?)",
-                (lh, hk卡, hk套, 装载日),
+                "INSERT INTO 链接_号卡套餐(哈希键, 号卡哈希, 套餐哈希, 装载日, 批号) VALUES (?,?,?,?,?)",
+                (lh, hk卡, hk套, 装载日, 批号),
             )
             报["链接"] += 1
 
@@ -81,8 +102,8 @@ def 装一批(体: dict[str, Any]) -> dict[str, Any]:
                 报["跳过"] += 1
                 continue
             conn.execute(
-                "INSERT INTO 链接_号卡客户(哈希键, 号卡哈希, 客户哈希, 装载日) VALUES (?,?,?,?)",
-                (lh, hk卡, hk客, 装载日),
+                "INSERT INTO 链接_号卡客户(哈希键, 号卡哈希, 客户哈希, 装载日, 批号) VALUES (?,?,?,?,?)",
+                (lh, hk卡, hk客, 装载日, 批号),
             )
             报["链接"] += 1
 
@@ -98,8 +119,8 @@ def 装一批(体: dict[str, Any]) -> dict[str, Any]:
             if 当前:
                 conn.execute(f"UPDATE {表} SET 是否当前=0 WHERE 编号=?", (当前["编号"],))
             conn.execute(
-                f"INSERT INTO {表}({父列}, 装载日, 载荷哈希, 属性, 是否当前) VALUES (?,?,?,?,1)",
-                (父哈希, 装载日, ph, json.dumps(属性, ensure_ascii=False)),
+                f"INSERT INTO {表}({父列}, 装载日, 载荷哈希, 属性, 是否当前, 批号) VALUES (?,?,?,?,1,?)",
+                (父哈希, 装载日, ph, json.dumps(属性, ensure_ascii=False), 批号),
             )
             报["卫星"] += 1
 
@@ -136,19 +157,41 @@ def 装一批(体: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(f"卫星订购无链接: {号}/{套}")
             开卫星("卫星_订购属性", "链接哈希", lh, 项.get("属性") or {})
 
+        # 同事务终结：提交证据（装载事务日志）与批次成功标志随正式数据同生共死
         conn.execute(
-            "INSERT INTO 装载批次(编号, 装载日, 时刻, 报告) VALUES (?,?,?,?)",
-            (批号, 装载日, 此刻(), json.dumps(报, ensure_ascii=False)),
+            "INSERT INTO 装载事务(事务号, 批号, 装载日, 提交时刻) VALUES (?,?,?,?)",
+            (事务号, 批号, 装载日, 此刻()),
         )
+        cur = conn.execute(
+            "UPDATE 装载批次 SET 状态='成功', 报告=? WHERE 编号=? AND 状态='装载中'",
+            (json.dumps(报, ensure_ascii=False), 批号),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(f"批次{批号}状态被并发改写，拒绝终结")
         conn.commit()
-        return {"结果": "成功", "批次编号": 批号, "装载日": 装载日, "报告": 报}
+        return {"结果": "成功", "批次编号": 批号, "装载日": 装载日, "事务号": 事务号, "报告": 报}
     except Exception as e:
-        conn.rollback()
-        conn.execute(
-            "INSERT INTO 隔离匣(原因, 载荷, 时刻) VALUES (?,?,?)",
-            (str(e), json.dumps(体, ensure_ascii=False)[:2000], 此刻()),
-        )
-        conn.commit()
-        return {"结果": "失败", "说明": str(e)}
+        conn.rollback()  # 正式三族该批增量整体归零，不存在段间提交残留
+        误 = str(e)
     finally:
         conn.close()
+
+    # ③ 失败记账（独立小事务）：批次非成功 + 隔离匣留证；
+    # 若连记账也失败，批次悬挂「装载中」，贯验见之失败闭。
+    conn2 = 连接()
+    try:
+        conn2.execute(
+            "UPDATE 装载批次 SET 状态='失败', 报告=? WHERE 编号=? AND 状态='装载中'",
+            (json.dumps({"错误": 误}, ensure_ascii=False), 批号),
+        )
+        conn2.execute(
+            "INSERT INTO 隔离匣(原因, 载荷, 时刻) VALUES (?,?,?)",
+            (误, json.dumps(体, ensure_ascii=False)[:2000], 此刻()),
+        )
+        conn2.commit()
+    except Exception as e2:
+        conn2.rollback()
+        return {"结果": "失败", "批次编号": 批号, "说明": f"{误}；失败记账亦失败:{e2}（批次悬挂装载中，贯验将失败闭）"}
+    finally:
+        conn2.close()
+    return {"结果": "失败", "批次编号": 批号, "说明": 误}
